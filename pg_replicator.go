@@ -4,14 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"pg-replication-kafka/logger"
 	"sync"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const outputPlugin = "pgoutput"
+
+var typeMap = pgtype.NewMap()
 
 type Replicator struct {
 	stateFilePath   string
@@ -21,17 +27,33 @@ type Replicator struct {
 	running         bool
 	stop            chan struct{}
 	mu              sync.RWMutex
+	err             error
+	db              string
+}
+
+type ReplicatePosition struct {
+	LastWriteLSN        pglogrepl.LSN
+	LastReceivedLSN     pglogrepl.LSN
+	UpdateStandbyStatus bool
+	Relations           map[uint32]*pglogrepl.RelationMessageV2
+
+	Rows       []*RowData
+	inStream   bool
+	CommitTime time.Time
+	Xid        uint32
 }
 
 func NewReplicateDSN(database string, user string, password string, host string, port string) string {
 	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable replication=database", host, port, user, password, database)
 }
 
-func NewReplicator(stateFilePath string, dsn string, slotName string, publicationName string) *Replicator {
+func NewReplicator(stateFilePath string, db string, dsn string, slotName string, publicationName string) *Replicator {
 	return &Replicator{
 		stateFilePath:   stateFilePath,
 		dsn:             dsn,
 		publicationName: publicationName,
+		stop:            make(chan struct{}),
+		db:              db,
 	}
 }
 
@@ -59,7 +81,7 @@ func (r *Replicator) checkPublicationExists(ctx context.Context, conn *pgconn.Pg
 		return false
 	}
 	result := results[0]
-	logger.Info(ctx).Interface("result", result).Msg("checkPublicationExists")
+	logger.Info(ctx).Interface("result", len(result.Rows) == 0).Msg("checkPublicationExists")
 	if len(result.Rows) == 0 {
 		return false
 	}
@@ -119,5 +141,290 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 		return err
 	}
 
+	// TODO: load from state file
+	startLSN := 0
+	beginLSN := pglogrepl.LSN(startLSN)
+
+	pluginArgs := []string{
+		"proto_version '2'",
+		"publication_names '" + r.publicationName + "'",
+		"messages 'true'",
+		"streaming 'true'",
+	}
+
+	err = pglogrepl.StartReplication(ctx, conn, slotName, beginLSN, pglogrepl.StartReplicationOptions{
+		PluginArgs: pluginArgs,
+		Mode:       pglogrepl.LogicalReplication,
+	})
+	if err != nil {
+		logger.ErrorWith(ctx, err).Msg("StartReplication error")
+		return err
+	}
+
+	r.mu.Lock()
+	r.running = true
+	r.mu.Unlock()
+
+	replicatePos := ReplicatePosition{
+		LastWriteLSN: beginLSN,
+		Relations:    map[uint32]*pglogrepl.RelationMessageV2{},
+	}
+
+	go func() {
+		defer func() {
+			r.stop <- struct{}{}
+		}()
+
+		for {
+
+			receiveCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+
+			var rawMsg pgproto3.BackendMessage
+			select {
+			case <-ctx.Done():
+				cancel()
+				return
+			default:
+				msg, err := conn.ReceiveMessage(receiveCtx)
+				cancel()
+				if pgconn.Timeout(err) || err == context.DeadlineExceeded {
+					continue
+				} else if err != nil {
+					logger.Info(ctx).Msg("ReceiveMessage timeout")
+					r.err = err
+					break
+				}
+				rawMsg = msg
+			}
+
+			if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+				err := fmt.Errorf("Received Postgres WAL error: %+v", errMsg)
+				r.err = err
+				break
+			}
+
+			msg, ok := rawMsg.(*pgproto3.CopyData)
+			if !ok {
+				err := fmt.Errorf("Received unexpected message: %+v", rawMsg)
+				r.err = err
+				break
+
+			}
+
+			switch msg.Data[0] {
+			case pglogrepl.PrimaryKeepaliveMessageByteID:
+				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+				if err != nil {
+					err := fmt.Errorf("ParsePrimaryKeepaliveMessage error: %+v", err)
+					r.err = err
+					return
+				}
+
+				if pkm.ServerWALEnd > replicatePos.LastWriteLSN {
+					replicatePos.LastWriteLSN = pkm.ServerWALEnd
+				}
+				if pkm.ReplyRequested {
+					replicatePos.UpdateStandbyStatus = true
+				}
+
+			case pglogrepl.XLogDataByteID:
+				xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+				if err != nil {
+					r.err = fmt.Errorf("ParseXLogData failed: %w", err)
+					return
+				}
+
+				commit, err := r.processMessage(ctx, xld, &replicatePos)
+				if err != nil {
+					r.err = fmt.Errorf("ParseXLogData failed: %w", err)
+					return
+				}
+
+				if commit {
+					// TODO
+					logger.Info(ctx).Interface("replicatePos", replicatePos).Msg("commit local")
+					replicatePos.Rows = nil
+				}
+
+				r.sendStandbyStatusUpdate(ctx, conn, replicatePos.LastWriteLSN, replicatePos.LastWriteLSN, replicatePos.LastReceivedLSN)
+			}
+
+		}
+
+	}()
+
+	<-r.stop
+	if err != nil {
+		logger.ErrorWith(ctx, r.err).Msg("replication stoped with error")
+		return r.err
+	}
+	logger.Info(ctx).Msg("replication stoped")
 	return nil
+}
+
+func (r *Replicator) processMessage(ctx context.Context, xld pglogrepl.XLogData, replicatePosition *ReplicatePosition) (bool, error) {
+	logicalMsg, err := pglogrepl.ParseV2(xld.WALData, replicatePosition.inStream)
+	if err != nil {
+		return false, fmt.Errorf("processMessage ParseV2: %+", err)
+	}
+
+	replicatePosition.LastReceivedLSN = xld.ServerWALEnd
+	switch logicalMsg := logicalMsg.(type) {
+	case *pglogrepl.RelationMessageV2:
+		replicatePosition.Relations[logicalMsg.RelationID] = logicalMsg
+	case *pglogrepl.BeginMessage:
+		// START TRANSACTION
+		if replicatePosition.LastWriteLSN < logicalMsg.FinalLSN {
+			replicatePosition.LastWriteLSN = logicalMsg.FinalLSN
+		}
+		replicatePosition.CommitTime = logicalMsg.CommitTime
+		replicatePosition.Xid = logicalMsg.Xid
+		logger.Info(ctx).Uint64("FinalLSN", uint64(logicalMsg.FinalLSN)).Msg("processMessage START TRANSACTION")
+
+	case *pglogrepl.CommitMessage:
+
+		// COMMIT
+		logger.Info(ctx).Uint64("CommitLSN", uint64(logicalMsg.CommitLSN)).Uint64("TransactionEndLSN", uint64(logicalMsg.TransactionEndLSN)).Msg("processMessage COMMIT")
+
+		return true, nil
+
+	case *pglogrepl.InsertMessageV2:
+		rel, ok := replicatePosition.Relations[logicalMsg.RelationID]
+		if !ok {
+			err := fmt.Errorf("insert action unknown relation id %d", logicalMsg.RelationID)
+			return false, err
+		}
+
+		rowData := RowData{}
+		rowData.Action = "insert"
+		rowData.Gtid = fmt.Sprintf("%d", replicatePosition.Xid)
+		rowData.LogPos = uint64(replicatePosition.LastWriteLSN)
+		rowData.Schema = r.db
+		rowData.Namespace = rel.Namespace
+		rowData.Table = rel.RelationName
+		rowData.Timestamp = uint32(replicatePosition.CommitTime.Unix())
+		insertValue, err := getMapValues(logicalMsg.Tuple.Columns, rel)
+		if err != nil {
+			logger.ErrorWith(ctx, err).Str("namespace", rel.Namespace).Str("RelationName", rel.RelationName).Msg("InsertMessageV2 error")
+		}
+		rowData.Values = insertValue
+
+		replicatePosition.Rows = append(replicatePosition.Rows, &rowData)
+
+	case *pglogrepl.UpdateMessageV2:
+		rel, ok := replicatePosition.Relations[logicalMsg.RelationID]
+		if !ok {
+			err := fmt.Errorf("update action unknown relation id %d", logicalMsg.RelationID)
+			return false, err
+		}
+
+		var oldValues map[string]any
+		if logicalMsg.OldTuple != nil {
+			oldValues, err = getMapValues(logicalMsg.OldTuple.Columns, rel)
+			if err != nil {
+				return false, err
+			}
+		}
+		newValues, err := getMapValues(logicalMsg.NewTuple.Columns, rel)
+		if err != nil {
+			return false, err
+		}
+
+		rowData := RowData{}
+		rowData.Action = "update"
+		rowData.Gtid = fmt.Sprintf("%d", replicatePosition.Xid)
+		rowData.LogPos = uint64(replicatePosition.LastWriteLSN)
+		rowData.Schema = r.db
+		rowData.Namespace = rel.Namespace
+		rowData.Table = rel.RelationName
+		rowData.BeforeValues = oldValues
+		rowData.AfterValues = newValues
+		rowData.Timestamp = uint32(replicatePosition.CommitTime.Unix())
+
+		replicatePosition.Rows = append(replicatePosition.Rows, &rowData)
+
+	case *pglogrepl.DeleteMessageV2:
+		rel, ok := replicatePosition.Relations[logicalMsg.RelationID]
+		if !ok {
+			err := fmt.Errorf("delete action unknown relation id %d", logicalMsg.RelationID)
+			return false, err
+		}
+
+		rowData := RowData{}
+		rowData.Action = "delete"
+		rowData.Gtid = fmt.Sprintf("%d", replicatePosition.Xid)
+		rowData.LogPos = uint64(replicatePosition.LastWriteLSN)
+		rowData.Schema = r.db
+		rowData.Namespace = rel.Namespace
+		rowData.Table = rel.RelationName
+		rowData.Timestamp = uint32(replicatePosition.CommitTime.Unix())
+		insertValue, err := getMapValues(logicalMsg.OldTuple.Columns, rel)
+		if err != nil {
+			logger.ErrorWith(ctx, err).Str("namespace", rel.Namespace).Str("RelationName", rel.RelationName).Msg("insertValue error")
+		}
+
+		rowData.Values = insertValue
+		replicatePosition.Rows = append(replicatePosition.Rows, &rowData)
+
+	case *pglogrepl.TruncateMessageV2:
+		logger.Info(ctx).Uint32("xid", logicalMsg.Xid).Msg("truncate message")
+
+	case *pglogrepl.TypeMessageV2:
+		logger.Info(ctx).Uint32("xid", logicalMsg.Xid).Msg("type message")
+
+	case *pglogrepl.OriginMessage:
+		logger.Info(ctx).Str("xid", logicalMsg.Name).Msg("origin message")
+
+	case *pglogrepl.LogicalDecodingMessageV2:
+		logger.Info(ctx).Uint32("xid", logicalMsg.Xid).Msg("logical decoding message")
+
+	case *pglogrepl.StreamStartMessageV2:
+		replicatePosition.inStream = true
+		logger.Info(ctx).Uint32("xid", logicalMsg.Xid).Msg("stream start message")
+
+	case *pglogrepl.StreamStopMessageV2:
+		replicatePosition.inStream = false
+		logger.Info(ctx).Msg("stream stop message")
+
+	case *pglogrepl.StreamCommitMessageV2:
+		logger.Info(ctx).Uint32("xid", logicalMsg.Xid).Msg("stream commit message")
+
+		log.Printf("Stream commit message: xid %d\n", logicalMsg.Xid)
+	case *pglogrepl.StreamAbortMessageV2:
+		logger.Info(ctx).Uint32("xid", logicalMsg.Xid).Msg("stream abort message")
+
+	default:
+		logger.Warn(ctx).Interface("logicalMsg", logicalMsg).Msg("unknown message type")
+	}
+
+	return false, nil
+}
+
+func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
+	if dt, ok := typeMap.TypeForOID(dataType); ok {
+		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
+	}
+	return string(data), nil
+}
+
+func getMapValues(cols []*pglogrepl.TupleDataColumn, rel *pglogrepl.RelationMessageV2) (map[string]any, error) {
+	values := map[string]any{}
+	for idx, col := range cols {
+		colName := rel.Columns[idx].Name
+		switch col.DataType {
+		case 'n': // null
+			values[colName] = nil
+		case 'u': // unchanged toast
+			// This TOAST value was not changed. TOAST values are not stored
+			// in the tuple, and logical replication doesn't want to spend a
+			// disk read to fetch its value for you.
+		case 't': //text
+			val, err := decodeTextColumnData(col.Data, rel.Columns[idx].DataType)
+			if err != nil {
+				return nil, fmt.Errorf("error decoding column data: %w", err)
+			}
+			values[colName] = val
+		}
+	}
+	return values, nil
 }

@@ -20,7 +20,7 @@ func main() {
 	flag.StringVar(&slotName, "slotName", "pg_replicate_kafka", "slot name")
 	flag.Parse()
 
-	logicReplicator := NewReplicator("state.json", NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName)
+	logicReplicator := NewReplicator("state.json", dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName)
 
 	ctx := context.Background()
 	err := logicReplicator.BeginReplication(ctx)

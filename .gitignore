@@ -7,7 +7,7 @@
 *.dll
 *.so
 *.dylib
-
+./pg-replication-kafka
 # Test binary, built with `go test -c`
 *.test
 

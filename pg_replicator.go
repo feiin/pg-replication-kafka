@@ -26,6 +26,7 @@ type Replicator struct {
 	slotName        string
 	running         bool
 	stop            chan struct{}
+	done            chan struct{}
 	mu              sync.RWMutex
 	err             error
 	db              string
@@ -52,7 +53,7 @@ func NewReplicator(stateFilePath string, db string, dsn string, slotName string,
 		stateFilePath:   stateFilePath,
 		dsn:             dsn,
 		publicationName: publicationName,
-		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 		db:              db,
 	}
 }
@@ -115,6 +116,23 @@ func (r *Replicator) createReplicationSlotIfNeed(ctx context.Context, conn *pgco
 	return nil
 }
 
+func (r *Replicator) IsRunning() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.running
+}
+
+func (r *Replicator) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.running {
+		return
+	}
+
+	close(r.stop)
+}
+
 func (r *Replicator) BeginReplication(ctx context.Context) error {
 	conn, err := pgconn.Connect(context.Background(), r.dsn)
 	if err != nil {
@@ -163,7 +181,10 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 
 	r.mu.Lock()
 	r.running = true
+	r.stop = make(chan struct{})
 	r.mu.Unlock()
+
+	logger.Info(ctx).Msg("begin replication")
 
 	replicatePos := ReplicatePosition{
 		LastWriteLSN: beginLSN,
@@ -172,15 +193,18 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 
 	go func() {
 		defer func() {
-			r.stop <- struct{}{}
+			r.done <- struct{}{}
 		}()
 
 		for {
 
-			receiveCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			receiveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
 			var rawMsg pgproto3.BackendMessage
 			select {
+			case <-r.stop:
+				logger.Info(ctx).Msg("replication stoped")
+				return
 			case <-ctx.Done():
 				cancel()
 				return
@@ -190,7 +214,7 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 				if pgconn.Timeout(err) || err == context.DeadlineExceeded {
 					continue
 				} else if err != nil {
-					logger.Info(ctx).Msg("ReceiveMessage timeout")
+					logger.ErrorWith(ctx, err).Msg("ReceiveMessage error")
 					r.err = err
 					break
 				}
@@ -242,23 +266,27 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 
 				if commit {
 					// TODO
+					replicatePos.UpdateStandbyStatus = true
 					logger.Info(ctx).Interface("replicatePos", replicatePos).Msg("commit local")
 					replicatePos.Rows = nil
 				}
 
+			}
+			if replicatePos.UpdateStandbyStatus {
 				r.sendStandbyStatusUpdate(ctx, conn, replicatePos.LastWriteLSN, replicatePos.LastWriteLSN, replicatePos.LastReceivedLSN)
+				replicatePos.UpdateStandbyStatus = false
 			}
 
 		}
 
 	}()
 
-	<-r.stop
+	<-r.done
 	if err != nil {
-		logger.ErrorWith(ctx, r.err).Msg("replication stoped with error")
+		logger.ErrorWith(ctx, r.err).Msg("replication done with error")
 		return r.err
 	}
-	logger.Info(ctx).Msg("replication stoped")
+	logger.Info(ctx).Msg("replication done")
 	return nil
 }
 
@@ -415,9 +443,6 @@ func getMapValues(cols []*pglogrepl.TupleDataColumn, rel *pglogrepl.RelationMess
 		case 'n': // null
 			values[colName] = nil
 		case 'u': // unchanged toast
-			// This TOAST value was not changed. TOAST values are not stored
-			// in the tuple, and logical replication doesn't want to spend a
-			// disk read to fetch its value for you.
 		case 't': //text
 			val, err := decodeTextColumnData(col.Data, rel.Columns[idx].DataType)
 			if err != nil {

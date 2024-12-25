@@ -23,6 +23,7 @@ func main() {
 	logicReplicator := NewReplicator("state.json", dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName)
 
 	ctx := context.Background()
+
 	err := logicReplicator.BeginReplication(ctx)
 	if err != nil {
 		logger.ErrorWith(ctx, err).Msg("BeginReplication error")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -30,6 +31,7 @@ type Replicator struct {
 	mu              sync.RWMutex
 	err             error
 	db              string
+	kafkaTopic      string
 }
 
 type ReplicatePosition struct {
@@ -48,13 +50,14 @@ func NewReplicateDSN(database string, user string, password string, host string,
 	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable replication=database", host, port, user, password, database)
 }
 
-func NewReplicator(stateFilePath string, db string, dsn string, slotName string, publicationName string) *Replicator {
+func NewReplicator(stateFilePath string, db string, dsn string, slotName string, publicationName string, kafkaTopic string) *Replicator {
 	return &Replicator{
 		stateFilePath:   stateFilePath,
 		dsn:             dsn,
 		publicationName: publicationName,
 		done:            make(chan struct{}),
 		db:              db,
+		kafkaTopic:      kafkaTopic,
 	}
 }
 
@@ -266,8 +269,22 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 
 				if commit {
 					// TODO
+					for _, row := range replicatePos.Rows {
+						encodeData, err := json.Marshal(row)
+						if err != nil {
+							logger.ErrorWith(ctx, err).Msg("json.Marshal row error")
+							r.err = err
+							return
+						}
+						err = sendKafkaMsg(ctx, encodeData, r.kafkaTopic)
+						if err != nil {
+							logger.ErrorWith(ctx, err).Str("kafkaTopic", r.kafkaTopic).Msg("sendKafkaMsg row error")
+							r.err = err
+							return
+						}
+					}
 					replicatePos.UpdateStandbyStatus = true
-					logger.Info(ctx).Interface("replicatePos", replicatePos).Msg("commit local")
+					logger.Info(ctx).Interface("LastWriteLSN", replicatePos.LastWriteLSN).Msg("commit local")
 					replicatePos.Rows = nil
 				}
 

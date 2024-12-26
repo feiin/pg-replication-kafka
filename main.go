@@ -4,13 +4,17 @@ import (
 	"context"
 	"flag"
 	"pg-replication-kafka/logger"
+	"strings"
 )
 
 var (
 	host, port, user, password, dbName, publicationName, slotName string
+	kafkaTopicName, kafkaAddr                                     string
 )
 
 func main() {
+	flag.StringVar(&kafkaTopicName, "kafka_topic_name", "", "Kafka topic name")
+	flag.StringVar(&kafkaAddr, "kafka_addr", "", "Kafka address")
 	flag.StringVar(&host, "host", "127.0.0.1", "postgres host")
 	flag.StringVar(&port, "port", "5432", "postgres port")
 	flag.StringVar(&user, "user", "postgres", "postgres user")
@@ -20,13 +24,24 @@ func main() {
 	flag.StringVar(&slotName, "slotName", "pg_replicate_kafka", "slot name")
 	flag.Parse()
 
-	logicReplicator := NewReplicator("state.json", dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName)
+	logicReplicator := NewReplicator("state.json", dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName, kafkaTopicName)
 
 	ctx := context.Background()
 
-	err := logicReplicator.BeginReplication(ctx)
+	kafkaAddress := strings.Split(kafkaAddr, ",")
+
+	err := InitKafka(kafkaAddress)
+	if err != nil {
+		logger.ErrorWith(context.Background(), err).Msg("InitKafka error")
+		panic(err)
+	}
+	logger.Info(ctx).Msg("connect kafka success")
+
+	err = logicReplicator.BeginReplication(ctx)
 	if err != nil {
 		logger.ErrorWith(ctx, err).Msg("BeginReplication error")
 	}
+
+	logger.Info(ctx).Msg("pg replication stopped")
 
 }

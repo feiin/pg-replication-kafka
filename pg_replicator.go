@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"pg-replication-kafka/logger"
+	"strconv"
 	"sync"
 	"time"
 
@@ -34,9 +36,13 @@ type Replicator struct {
 	kafkaTopic      string
 }
 
+type ReplicationStatus struct {
+	LastWriteLSN    pglogrepl.LSN
+	LastReceivedLSN pglogrepl.LSN
+}
+
 type ReplicatePosition struct {
-	LastWriteLSN        pglogrepl.LSN
-	LastReceivedLSN     pglogrepl.LSN
+	ReplicationStatus
 	UpdateStandbyStatus bool
 	Relations           map[uint32]*pglogrepl.RelationMessageV2
 
@@ -136,6 +142,42 @@ func (r *Replicator) Stop() {
 	close(r.stop)
 }
 
+func (r *Replicator) SyncReplicateStatus(ctx context.Context, status *ReplicationStatus) error {
+	return os.WriteFile(r.stateFilePath, []byte(fmt.Sprintf("%d", status.LastWriteLSN)), 0644)
+}
+
+func (r *Replicator) GetLastReplicateStatus(ctx context.Context) pglogrepl.LSN {
+	_, err := os.Stat(r.stateFilePath)
+	if err != nil && os.IsNotExist(err) {
+		return 0
+	}
+
+	if err != nil {
+		logger.ErrorWith(ctx, err).Msg("GetLastReplicateStatus error")
+		return 0
+	}
+
+	// read file
+
+	data, err := os.ReadFile(r.stateFilePath)
+	if err != nil {
+		logger.ErrorWith(ctx, err).Msg("GetLastReplicateStatus ReadFile error")
+		return 0
+	}
+
+	stringLSN := string(data)
+	// convert to LSN
+	lsn, err := strconv.ParseUint(stringLSN, 10, 64)
+
+	if err != nil {
+		logger.ErrorWith(ctx, err).Msg("GetLastReplicateStatus ParseUint error")
+		return 0
+	}
+
+	return pglogrepl.LSN(lsn)
+
+}
+
 func (r *Replicator) BeginReplication(ctx context.Context) error {
 	conn, err := pgconn.Connect(context.Background(), r.dsn)
 	if err != nil {
@@ -162,9 +204,14 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 		return err
 	}
 
-	// TODO: load from state file
 	startLSN := 0
 	beginLSN := pglogrepl.LSN(startLSN)
+
+	// load from state file
+	stateLSN := r.GetLastReplicateStatus(ctx)
+	if stateLSN > beginLSN {
+		beginLSN = stateLSN
+	}
 
 	pluginArgs := []string{
 		"proto_version '2'",
@@ -190,8 +237,10 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 	logger.Info(ctx).Msg("begin replication")
 
 	replicatePos := ReplicatePosition{
-		LastWriteLSN: beginLSN,
-		Relations:    map[uint32]*pglogrepl.RelationMessageV2{},
+		ReplicationStatus: ReplicationStatus{
+			LastWriteLSN: beginLSN,
+		},
+		Relations: map[uint32]*pglogrepl.RelationMessageV2{},
 	}
 
 	go func() {
@@ -310,7 +359,7 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 func (r *Replicator) processMessage(ctx context.Context, xld pglogrepl.XLogData, replicatePosition *ReplicatePosition) (bool, error) {
 	logicalMsg, err := pglogrepl.ParseV2(xld.WALData, replicatePosition.inStream)
 	if err != nil {
-		return false, fmt.Errorf("processMessage ParseV2: %+", err)
+		return false, fmt.Errorf("processMessage ParseV2: %+v", err)
 	}
 
 	replicatePosition.LastReceivedLSN = xld.ServerWALEnd

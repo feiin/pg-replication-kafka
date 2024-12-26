@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"pg-replication-kafka/logger"
 	"strings"
 )
@@ -24,7 +25,8 @@ func main() {
 	flag.StringVar(&slotName, "slotName", "pg_replicate_kafka", "slot name")
 	flag.Parse()
 
-	logicReplicator := NewReplicator("state.json", dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName, kafkaTopicName)
+	defaultStateFile := fmt.Sprintf("pg_replication_%s.state", dbName)
+	logicReplicator := NewReplicator(defaultStateFile, dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName, kafkaTopicName)
 
 	ctx := context.Background()
 

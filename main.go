@@ -9,15 +9,16 @@ import (
 )
 
 var (
-	host, port, user, password, dbName, publicationName, slotName string
-	kafkaTopicName, kafkaAddr                                     string
+	port                                                    int
+	host, user, password, dbName, publicationName, slotName string
+	kafkaTopicName, kafkaAddr                               string
 )
 
 func main() {
 	flag.StringVar(&kafkaTopicName, "kafka_topic_name", "", "Kafka topic name")
 	flag.StringVar(&kafkaAddr, "kafka_addr", "", "Kafka address")
 	flag.StringVar(&host, "host", "127.0.0.1", "postgres host")
-	flag.StringVar(&port, "port", "5432", "postgres port")
+	flag.IntVar(&port, "port", 5432, "postgres port")
 	flag.StringVar(&user, "user", "postgres", "postgres user")
 	flag.StringVar(&password, "password", "", "postgres password")
 	flag.StringVar(&dbName, "db", "postgres", "postgres database name")

@@ -52,8 +52,8 @@ type ReplicatePosition struct {
 	Xid        uint32
 }
 
-func NewReplicateDSN(database string, user string, password string, host string, port string) string {
-	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable replication=database", host, port, user, password, database)
+func NewReplicateDSN(database string, user string, password string, host string, port int) string {
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable replication=database", host, port, user, password, database)
 }
 
 func NewReplicator(stateFilePath string, db string, dsn string, slotName string, publicationName string, kafkaTopic string) *Replicator {

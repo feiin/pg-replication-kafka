@@ -22,7 +22,7 @@ func main() {
 	flag.StringVar(&password, "password", "", "postgres password")
 	flag.StringVar(&dbName, "db", "postgres", "postgres database name")
 	flag.StringVar(&publicationName, "pubname", "", "publication name created via CREATE PUBLICATION {name} FOR ALL TABLES")
-	flag.StringVar(&slotName, "slotName", "pg_replicate_kafka", "slot name")
+	flag.StringVar(&slotName, "slot_name", "pg_replicate_kafka", "slot name")
 	flag.Parse()
 
 	defaultStateFile := fmt.Sprintf("pg_replication_%s.state", dbName)

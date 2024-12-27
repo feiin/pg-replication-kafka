@@ -79,6 +79,8 @@ func (r *Replicator) sendStandbyStatusUpdate(ctx context.Context, conn *pgconn.P
 		return err
 	}
 
+	r.SyncReplicateStatus(ctx, lastWriteLSN)
+
 	logger.Info(ctx).Uint64("lastWriteLSN", uint64(lastWriteLSN)).Uint64("lastFlushLSN", uint64(lastFlushLSN)).Uint64("lastApplyLSN", uint64(lastApplyLSN)).Msg("sendStandbyStatusUpdate success")
 	return nil
 }
@@ -142,8 +144,8 @@ func (r *Replicator) Stop() {
 	close(r.stop)
 }
 
-func (r *Replicator) SyncReplicateStatus(ctx context.Context, status *ReplicationStatus) error {
-	return os.WriteFile(r.stateFilePath, []byte(fmt.Sprintf("%d", status.LastWriteLSN)), 0644)
+func (r *Replicator) SyncReplicateStatus(ctx context.Context, lastWriteLSN pglogrepl.LSN) error {
+	return os.WriteFile(r.stateFilePath, []byte(fmt.Sprintf("%d", lastWriteLSN)), 0644)
 }
 
 func (r *Replicator) GetLastReplicateStatus(ctx context.Context) pglogrepl.LSN {
@@ -234,7 +236,7 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 	r.stop = make(chan struct{})
 	r.mu.Unlock()
 
-	logger.Info(ctx).Msg("begin replication")
+	logger.Info(ctx).Uint64("beginLSN", uint64(beginLSN)).Msg("begin replication")
 
 	replicatePos := ReplicatePosition{
 		ReplicationStatus: ReplicationStatus{

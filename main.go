@@ -12,6 +12,8 @@ var (
 	port                                                    int
 	host, user, password, dbName, publicationName, slotName string
 	kafkaTopicName, kafkaAddr                               string
+	stateFilePath                                           string
+	isDebug                                                 bool
 )
 
 func main() {
@@ -24,9 +26,15 @@ func main() {
 	flag.StringVar(&dbName, "db", "postgres", "postgres database name")
 	flag.StringVar(&publicationName, "pubname", "", "publication name created via CREATE PUBLICATION {name} FOR ALL TABLES")
 	flag.StringVar(&slotName, "slot_name", "pg_replicate_kafka", "slot name")
+	flag.BoolVar(&isDebug, "debug", false, "is debug mode")
+	flag.StringVar(&stateFilePath, "replicate_state_file", "", "save replicate state point")
 	flag.Parse()
 
 	defaultStateFile := fmt.Sprintf("pg_replication_%s.state", dbName)
+	if len(stateFilePath) > 0 {
+		defaultStateFile = stateFilePath
+	}
+
 	logicReplicator := NewReplicator(defaultStateFile, dbName, NewReplicateDSN(dbName, user, password, host, port), slotName, publicationName, kafkaTopicName)
 
 	ctx := context.Background()

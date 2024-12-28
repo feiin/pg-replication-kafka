@@ -333,7 +333,9 @@ func (r *Replicator) BeginReplication(ctx context.Context) error {
 							r.err = err
 							return
 						}
-						// logger.Debug(ctx).Interface("row", row).Msg("push to kafka")
+						if isDebug {
+							logger.Debug(ctx).Interface("row", row).Msg("pushed to kafka")
+						}
 					}
 					replicatePos.UpdateStandbyStatus = true
 					logger.Info(ctx).Interface("LastWriteLSN", replicatePos.LastWriteLSN).Msg("commit local")

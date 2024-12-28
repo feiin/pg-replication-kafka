@@ -47,19 +47,20 @@ PostgreSQL logical replication to Kafka
 
 ## Options
 
-确保数据库wal_level为逻辑复制logical， wal_level = logical 开启逻辑复制
+确保数据库wal_level为逻辑复制logical
 
 ```postgres
 show wal_level;  检查是否为logical
 ```
 
+自建可以修改conf文件:
 ```
 # change requires restart
 wal_level = logical
 max_wal_senders = 10		# max number of walsender processes
 max_replication_slots = 10	# max number of replication slots
 ```
-云服务如需配置见云产商说明，如阿里云 https://help.aliyun.com/zh/rds/apsaradb-rds-for-postgresql/logical-subscription
+RDS云服务如需配置见云产商说明，如阿里云 https://help.aliyun.com/zh/rds/apsaradb-rds-for-postgresql/logical-subscription
 
 
 - kafka_addr 推送目标kafka的地址
@@ -69,24 +70,26 @@ max_replication_slots = 10	# max number of replication slots
 - postgres postgres源库用户名
 - password postgres源库密码
 - db postgres源库database实例名称
-- pubname publication name，通过下面语句创建,源库里执行:
-```
-# CREATE PUBLICATION <发布名称> FOR TABLE <表名>;
+- pubname publication name，通过下面语句创建发布名称,源库里执行:
+    ```
+    # CREATE PUBLICATION <发布名称> FOR TABLE <表名>;
 
-CREATE PUBLICATION test FOR ALL TABLES
+    CREATE PUBLICATION test FOR ALL TABLES
 
-# view 
-SELECT * FROM pg_publication;
-```
+    # view 
+    SELECT * FROM pg_publication;
+    ```
 
-如果update的action需要before_values需要修改表的REPLICA IDENTITY(复制标识)配置模式为FULL，否则before_values为空
+    如果update的action需要before_values需要修改表的REPLICA IDENTITY(复制标识)配置模式为FULL，否则before_values为空
 
-```
-ALTER TABLE test_tablename REPLICA IDENTITY FULL;
+    ```
+    ALTER TABLE test_tablename REPLICA IDENTITY FULL;
 
-```
+    ```
 
 - slot_name 逻辑复制槽,程序默认为`pg_replicate_kafka`
+- debug 开启调试模式时，会输出推送kafka消息详情
+
 
 
  

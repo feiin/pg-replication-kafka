@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"pg-replication-kafka/logger"
 	"strings"
 )
@@ -13,10 +14,14 @@ var (
 	host, user, password, dbName, publicationName, slotName string
 	kafkaTopicName, kafkaAddr                               string
 	stateFilePath                                           string
-	isDebug                                                 bool
+	isDebug, version                                        bool
 )
 
+const AppVersion = "0.1.0"
+
 func main() {
+
+	flag.BoolVar(&version, "v", false, "version")
 	flag.StringVar(&kafkaTopicName, "kafka_topic_name", "", "Kafka topic name")
 	flag.StringVar(&kafkaAddr, "kafka_addr", "", "Kafka address")
 	flag.StringVar(&host, "host", "127.0.0.1", "postgres host")
@@ -29,6 +34,11 @@ func main() {
 	flag.BoolVar(&isDebug, "debug", false, "is debug mode")
 	flag.StringVar(&stateFilePath, "replicate_state_file", "", "save replicate state point")
 	flag.Parse()
+	if version {
+		fmt.Println(AppVersion)
+		os.Exit(0)
+		return
+	}
 
 	defaultStateFile := fmt.Sprintf("pg_replication_%s.state", dbName)
 	if len(stateFilePath) > 0 {

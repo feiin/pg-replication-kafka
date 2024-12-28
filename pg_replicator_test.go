@@ -8,7 +8,7 @@ import (
 func TestSaveReplicateState(t *testing.T) {
 	r := NewReplicator("./test.state", "test_db", "", "test_pubname", "test_slotname", "test_kafkatopic")
 
-	err := r.SyncReplicateStatus(context.Background(), &ReplicationStatus{LastWriteLSN: 999})
+	err := r.SyncReplicateStatus(context.Background(), 999)
 	if err != nil {
 		t.Error("SyncReplicateStatus error")
 	}
